@@ -38,11 +38,16 @@ running the scripts.
   output tensor, captured from the PyTorch `ExportedProgram`. Used as
   the cross-runtime parity baseline.
 * **PyTorch ≥ 2.9 ExportedProgram** — `model.pt2`, bit-exact round-trip.
-* **QNN / QAIRT** — FP32 `model.dlc` from `qairt-converter`, INT8
-  `model_int8.dlc` (per-channel) from `qairt-quantizer`, and
-  `model_int8_htp.dlc` with offline cache for Hexagon `v68/v73/v75/v79`
-  built by `snpe-dlc-graph-prepare`. The successful prepare across all
-  four archs is the deployment-readiness signal.
+* **QNN / QAIRT** — `qairt-converter` runs twice: once with
+  `--float_bitwidth 32` to produce `model.dlc` (reference, every op
+  mapped) and once with `--float_bitwidth 16` to produce
+  `model_fp16.dlc` (HTP-deployable). Nothing else: no CPU smoke run,
+  no `qairt-quantizer` (INT8 calibration belongs to the deployment
+  pipeline with real data), and no `snpe-dlc-graph-prepare` (offline
+  HTP cache is rebuilt on-target by the deploying app with its own
+  VTCM / thread / DLBC settings). The DLC alone is the deployment
+  artifact; the on-device QNN runtime JIT-compiles to Hexagon at first
+  inference.
 * **CoreML** — `model.mlpackage` (MLProgram, FP16 or FP32, iOS17 minimum).
   `predict()` is macOS-only — the conversion side validates and saves;
   on-device verification is done from a Mac.

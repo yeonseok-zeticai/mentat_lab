@@ -7,9 +7,9 @@ index and produces, for **every** advertised variant:
 * a sample input as `.npy` + the matching reference output captured
   from the same PyTorch graph,
 * an ONNX export (with external-data when weights exceed 2 GB),
-* Qualcomm QNN/QAIRT artifacts: FP32 `model.dlc`, INT8 per-channel
-  `model_int8.dlc`, and `model_int8_htp.dlc` with offline cache for
-  Hexagon `v68 / v73 / v75 / v79`,
+* Qualcomm QNN/QAIRT artifacts: FP32 `model.dlc` and FP16
+  `model_fp16.dlc` (both HTP-deployable; the on-device QNN runtime
+  JIT-compiles to Hexagon at first inference),
 * an Apple CoreML `model.mlpackage` (MLProgram, FP16, iOS17 minimum).
 
 `facebook/sapiens2` is an **index** repo — it points to a fan-out of
@@ -83,19 +83,10 @@ Source family: <https://huggingface.co/facebook/sapiens2>
                 │
                 └── run_qnn.sh
                         │
-                        ├── qairt-converter ─► model.dlc
+                        ├── qairt-converter --float_bitwidth 32 ─► model.dlc
                         │
-                        └── qairt-quantizer (INT8 per-channel)
-                                │
-                                ▼
-                          model_int8.dlc
-                                │
-                                ▼
-              snpe-dlc-graph-prepare --htp_archs=v68,v73,v75,v79
-                                │
-                                ▼
-                       model_int8_htp.dlc
-                       (HTP offline cache: SM7350 / SM8550 / SM8650 / SM8750)
+                        └── qairt-converter --float_bitwidth 16 ─► model_fp16.dlc
+                                                          (both HTP-deployable)
 ```
 
 ## What's in the catalog
@@ -198,46 +189,51 @@ VARIANTS="pretrain:0.1b pose:0.4b seg:0.4b" bash runner/run_all.sh
 SKIP_STAGES=qnn_convert bash runner/run_all.sh
 ```
 
-Wall-time scaling is dominated by `snpe-dlc-graph-prepare` (HTP offline
-cache for 4 archs), which is roughly linear in MACs:
+After dropping `snpe-dlc-graph-prepare` (and the CPU smoke + INT8
+quantize steps), wall-time per variant is dominated by `onnx_export` +
+`coreml_convert` + the two `qairt-converter` calls:
 
-| size | params | end-to-end / variant | × 5 sizes |
-|---|---|---|---|
-| 0.1B | 0.114 B | ~17 min | (only one) |
-| 0.4B | 0.398 B | ~1 h | × 5 |
-| 0.8B | 0.818 B | ~2 h | × 5 |
-| 1B | 1.46 B | ~3 h | × 5 |
-| 5B | 5.07 B | ~10 h | × 5 |
+| size | params | end-to-end / variant |
+|---|---|---|
+| 0.1B | 0.114 B | ~3 min |
+| 0.4B | 0.398 B | ~10 min |
+| 0.8B | 0.818 B | ~20 min |
+| 1B | 1.46 B | ~40 min |
+| 5B | 5.07 B | ~2 h |
 
-A full sweep is **~3 days** of wall time. The orchestrator tolerates
-failure, persists progress, and writes one row of `RESULTS.md` per
-variant — partial state is always usable.
+A full 21-variant sweep is **~12 hours** of wall time. The orchestrator
+tolerates failure, persists progress, and writes one row of `RESULTS.md`
+per variant — partial state is always usable.
 
-## QNN HTP backend verification
+## QNN: just `qairt-converter`
 
-The same three-step QNN pipeline as `pose_estimation_mediapipe`:
+`run_qnn.sh` runs `qairt-converter` twice and stops:
 
-1. **Convert** — `qairt-converter --float_bitwidth 32 --source_model_input_layout NCHW`
-   produces FP32 `model.dlc`. Sapiens2 is mostly Conv2d (patch embed),
-   matmul (attn / FFN), softmax, RMSNorm-equivalent and gather (RoPE
-   rotate); all map cleanly to QNN ops.
-2. **Quantize** — `qairt-quantizer --target_backend HTP --use_per_channel_quantization`
-   produces `model_int8.dlc` with `model_int8_encoding.json` (per-tensor
-   scale/offset). Single-image calibration with `sample_input.npy` is
-   enough to exercise the toolchain; production deployments should
-   re-calibrate with a representative batch of images.
-3. **Offline HTP graph prepare** — `snpe-dlc-graph-prepare --htp_archs=v68,v73,v75,v79`
-   serializes optimized HTP cache records for SoCs from
-   Snapdragon 7-Gen3 through 8-Gen3 / 8-Elite. Successful prepare across
-   all four archs (`SM7350 / SM8550 / SM8650 / SM8750 : Success`) is the
-   formal "HTP-ready" signal — every op fused cleanly, no fallbacks.
+| artifact | flag | notes |
+|---|---|---|
+| `model.dlc` | `--float_bitwidth 32` | FP32 reference, all ops mapped |
+| `model_fp16.dlc` | `--float_bitwidth 16` | the HTP-target artifact |
 
-The runner intentionally **skips the x86 HTP simulator step** that is
-used for `pose_estimation_mediapipe`. ViT-scale models take ~15 min /
-inference at the 0.1 B size on the simulator and **hours** at 5 B; the
-prepare-success-across-archs signal is the actual deployment gate.
-On-device validation happens after the artifacts are deployed to the
-target SoC, not as part of this offline build.
+Sapiens2 is mostly Conv2d (patch embed), matmul (attn / FFN), softmax,
+RMSNorm-equivalent and gather (RoPE rotate); all map cleanly to QNN ops.
+`qairt-dlc-info` is run once on `model.dlc` to sanity-check the per-op
+runtime support matrix (`A:AIP / D:DSP / G:GPU / C:CPU`).
+
+We deliberately do **not** run any of:
+
+* `qnn-net-run --backend libQnnCpu.so`  — CPU smoke isn't a deployment
+  artifact, ONNX Runtime already gives us the FP32 reference.
+* `qairt-quantizer`  — INT8 calibration belongs to the deployment
+  pipeline with real data, not this offline bundle stage.
+* `snpe-dlc-graph-prepare`  — offline HTP cache is a startup-latency
+  optimisation. The on-device QNN runtime JIT-compiles the graph for
+  the actual target SoC (with the deploying app's VTCM/thread/DLBC
+  settings). Pre-baking caches at build time would freeze a prepare
+  config the runtime would discard, and at ViT scale `graph_prepare`
+  costs ~7 s/M params per arch (4 archs × 5 B = ~10 hours per variant).
+
+Per-variant QNN time is now in the **2–10 minute** range across the
+whole 0.1B → 5B family.
 
 ## CoreML
 
@@ -281,10 +277,8 @@ RESULTS.md                         ← per-variant pipeline status (auto-updated
 ├── sample_output.npy              ← reference output from the PyTorch graph
 ├── model.pt2                      ← torch.export ExportedProgram
 ├── model.onnx (+ .data)           ← ONNX export (external data when >2 GB)
-├── model.dlc                      ← QNN/QAIRT FP32 DLC
-├── model_int8.dlc                 ← INT8 per-channel quantised DLC
-├── model_int8_encoding.json       ← per-tensor scale/offset
-├── model_int8_htp.dlc             ← INT8 + HTP offline cache (v68/v73/v75/v79)
+├── model.dlc                      ← QNN/QAIRT FP32 DLC (reference)
+├── model_fp16.dlc                 ← QNN/QAIRT FP16 DLC (HTP-deployable)
 ├── model.mlpackage/               ← CoreML MLProgram (FP16, iOS17 min)
 ├── metadata.json                  ← per-stage status + I/O contract
 └── build.log                      ← full pipeline stdout/stderr

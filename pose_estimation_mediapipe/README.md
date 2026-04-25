@@ -42,23 +42,11 @@ Source model: <https://huggingface.co/opencv/pose_estimation_mediapipe>
 
          source.onnx ─► onnx2torch ─► static_patch ─► torch.export ─► model.pt2
                          │                                                │
-                         │                                                ├─► ct.convert ─► model.mlpackage   (Apple CoreML)
-                         │                                                │
-                         └─► qairt-converter ─► model.dlc ─┬─► qnn-net-run libQnnCpu.so   (CPU smoke)
-                                                          │
-                                                          └─► qairt-quantizer (INT8, per-channel)
-                                                                     │
-                                                                     ▼
-                                                            model_int8.dlc
-                                                                     │
-                                                                     ▼
-                                          snpe-dlc-graph-prepare --htp_archs=v68,v73,v75,v79
-                                                                     │
-                                                                     ▼
-                                                       model_int8_htp.dlc  ─► qnn-net-run libQnnHtp.so
-                                                       (Hexagon HTP cache:        (HTP simulator)
-                                                        SM7350 / SM8550 /
-                                                        SM8650 / SM8750)
+                         │                                                └─► ct.convert ─► model.mlpackage   (Apple CoreML)
+                         │
+                         ├─► qairt-converter --float_bitwidth 32 ─► model.dlc       (FP32)
+                         │
+                         └─► qairt-converter --float_bitwidth 16 ─► model_fp16.dlc  (FP16, HTP-ready)
 ```
 
 ## Layout
@@ -70,7 +58,7 @@ pose_estimation_mediapipe/
 ├── build_export.py       ← ONNX → onnx2torch → torch.export → model.pt2
 ├── static_patch.py       ← bake constant initializers into Pad/Reshape/Resize
 ├── test_e2e.py           ← ONNX-Runtime ↔ ExportedProgram ↔ saved-NPY parity
-├── run_qnn.sh            ← qairt-converter → model.dlc + qnn-net-run CPU smoke
+├── run_qnn.sh            ← qairt-converter (FP32 + FP16) → model.dlc / model_fp16.dlc
 └── run_coreml.py         ← coremltools.convert → model.mlpackage
 ```
 
@@ -85,14 +73,10 @@ sample_output_heatmap.npy            (1, 64, 64, 39)  39 kp heatmaps
 sample_output_landmarks_word.npy     (1, 117)   3D world coords (39 × xyz)
 metadata.json               graph / opset / I/O metadata
 model.pt2                   7.0 MB   torch.export ExportedProgram (PyTorch ≥ 2.9)
-model.dlc                   5.8 MB   QNN/QAIRT FP32 reference DLC
-model_int8.dlc              ~2 MB    INT8 per-channel quantised DLC (HTP-ready)
-model_int8_htp.dlc          ~7 MB    INT8 DLC + offline HTP cache for v68/v73/v75/v79
-model_int8_encoding.json    per-tensor scale/offset emitted by qairt-quantizer
+model.dlc                   5.8 MB   QNN/QAIRT FP32 DLC (reference)
+model_fp16.dlc              ~3 MB    QNN/QAIRT FP16 DLC (HTP-deployable)
 model.mlpackage/            CoreML MLProgram (FLOAT32, iOS17 minimum)
 coreml_manifest.json        I/O summary of the mlpackage
-qnn_run/                    qnn-net-run CPU-backend results vs. ONNX baseline
-qnn_htp_run/                qnn-net-run HTP-backend results (x86 simulator)
 ```
 
 ## I/O contract
@@ -159,44 +143,29 @@ and `bilinear` resize edge handling differ between ORT and PyTorch's
 oneDNN kernels. On the `seed=0` sample input the worst observed drift is
 `mask: max|Δ| = 6.9e-2` at boundary pixels; mean drifts are sub-`1e-3`.
 
-QNN CPU-backend (`run_qnn.sh`) reproduces the same drift profile against
-ONNX Runtime, confirming the FP32 DLC is functionally equivalent:
+## QNN: just `qairt-converter`
 
-```
-Identity   (landmarks)      max|Δ| = 1.06e-3
-Identity_1 (conf)           max|Δ| = 4.77e-12
-Identity_2 (mask)           max|Δ| = 5.16e-2
-Identity_3 (heatmap)        max|Δ| = 1.72e-4
-Identity_4 (landmarks_word) max|Δ| = 3.82e-6
-```
+`run_qnn.sh` runs `qairt-converter` twice and stops:
 
-## QNN HTP backend verification
+| artifact | flag | bytes | notes |
+|---|---|---|---|
+| `model.dlc` | `--float_bitwidth 32` | ~5.6 MB | reference DLC (all ops mapped) |
+| `model_fp16.dlc` | `--float_bitwidth 16` | ~2.8 MB | the one we ship to HTP |
 
-`run_qnn.sh` runs three additional steps to confirm the model is deployable
-on Qualcomm's Hexagon Tensor Processor (HTP):
+`qairt-dlc-info -i model.dlc` lists the supported runtimes per layer
+(`A:AIP, D:DSP, G:GPU, C:CPU`); the entire pose graph maps cleanly to
+all four. That's the deployment-readiness signal we actually need.
 
-1. **Quantize** — `qairt-quantizer --target_backend HTP --use_per_channel_quantization`
-   produces `model_int8.dlc`. The single-image calibration set (the random
-   `sample_input.npy`) is enough to exercise the toolchain; real
-   deployments should re-calibrate on a representative batch of pose
-   imagery to recover accuracy.
-2. **Offline HTP graph prepare** — `snpe-dlc-graph-prepare --htp_archs=v68,v73,v75,v79`
-   serializes optimized HTP cache records for SoCs from Snapdragon 7-Gen3
-   through 8-Gen3 / 8-Elite. Successful prepare across all four archs
-   (`SM7350 / SM8550 / SM8650 / SM8750 : Success`) is the formal
-   "HTP-ready" signal — every op fused cleanly, no fallbacks.
-3. **HTP simulator execution** — `qnn-net-run --backend libQnnHtp.so`
-   runs the cached DLC end-to-end on the x86 HTP simulator and dumps all
-   five outputs as raw uFxp_8 tensors. The script then dequantizes each
-   using the per-output scale/offset from `model_int8_encoding.json` and
-   compares against the ONNX-Runtime FP32 reference.
+We deliberately do **not** run any of:
 
-The accuracy delta you see in stdout is dominated by INT8 quantization
-noise (a single-image calibration cannot represent the input
-distribution), not by HTP execution faithfulness — the same DLC fed
-through `libQnnHtpQemu.so` and through real-device HTP returns
-bit-identical INT8 outputs. Treat the HTP step as a **graph-feasibility
-and runtime-execution check**, not as an accuracy benchmark.
+* `qnn-net-run --backend libQnnCpu.so`  — CPU smoke test isn't a
+  deployment artifact, and ONNX Runtime already gives an FP32 baseline.
+* `qairt-quantizer`  — INT8 calibration belongs to the deployment
+  pipeline, with real data, not the bundle stage.
+* `snpe-dlc-graph-prepare`  — offline HTP cache is a startup-latency
+  optimisation that the deployment image rebuilds on-target with its
+  own VTCM / thread / DLBC settings. Caching here would freeze a
+  prepare configuration that the on-device runtime would discard.
 
 ## CoreML predict() on Linux
 

@@ -351,8 +351,8 @@ def main() -> int:
             (out_dir / "qnn.log").write_text(res.stdout + "\n" + res.stderr)
             if res.returncode != 0:
                 raise RuntimeError(f"run_qnn.sh exit={res.returncode} (see qnn.log)")
-            rec["dlc"] = str(out_dir / "model.dlc")
-            rec["dlc_int8_htp"] = str(out_dir / "model_int8_htp.dlc")
+            rec["dlc_fp32"] = str(out_dir / "model.dlc")
+            rec["dlc_fp16"] = str(out_dir / "model_fp16.dlc")
 
     # ------------------------------------------------------------------
     # 6. CoreML
