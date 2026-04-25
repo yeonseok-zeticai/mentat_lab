@@ -1,0 +1,22 @@
+# Local SDK / toolchain symlinks (host-specific).
+qnn_244
+
+# Cloned upstream repos (kept as a sibling clone so the runner can import,
+# but the third-party source itself is not part of this repo).
+sapiens2/sapiens2/
+
+# Python bytecode / caches.
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Logs.
+*.log
+build.log
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
