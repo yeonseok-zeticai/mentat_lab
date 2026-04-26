@@ -12,11 +12,15 @@ saved reference:
   2. ONNX Runtime CPU (`model.onnx`).
   3. (optional) QNN CPU backend (`model.dlc` via `qnn-net-run libQnnCpu.so`).
 
-Tolerances:
-  * pt2 round-trip is expected bit-exact (atol = 0).
-  * ORT cross-runtime drift comes from kernel-level math differences
-    (Conv accumulation order, softmax fast-paths) — atol = 1e-3.
-  * QNN CPU is lower precision still — atol = 1e-2 by default.
+Tolerances are *relative-to-range* (`max|Δ| / max|ref|`) — sapiens2 task
+heads return unnormalised logits with dynamic ranges from ±1 (pose
+heatmaps) up to ±1500 (seg logits), so absolute thresholds would
+falsely flag low-relative drift on the high-range outputs:
+
+  * pt2 round-trip is expected bit-exact (rel = 0).
+  * ORT cross-runtime drift from kernel-level math differences
+    (Conv accumulation order, softmax fast-paths) — rel = 1e-3.
+  * QNN CPU is lower precision still — rel = 1e-2 by default.
 
 Records numbers under ``stages.verify_*`` in ``metadata.json`` so the
 parent runner can roll the result up to ``RESULTS.md``.
@@ -34,9 +38,12 @@ from typing import Optional
 import numpy as np
 import torch
 
-PT2_ATOL = 0.0
-ORT_ATOL = 1e-3
-QNN_CPU_ATOL = 1e-2
+# Relative-to-range thresholds: max|Δ| divided by the largest |ref| value.
+# Sapiens2 task heads return unnormalised logits (seg goes to ±1500, normal
+# to ±80), so absolute tolerances would falsely flag low-relative drift.
+PT2_RTOL = 0.0      # ExportedProgram round-trip is bit-exact
+ORT_RTOL = 1e-3     # ONNX-Runtime cross-runtime float drift
+QNN_CPU_RTOL = 1e-2 # QNN CPU backend, looser still
 
 
 def _to_numpy(t):
@@ -45,15 +52,16 @@ def _to_numpy(t):
     return np.asarray(t)
 
 
-def compare(label: str, ref: np.ndarray, got: np.ndarray, atol: float) -> dict:
+def compare(label: str, ref: np.ndarray, got: np.ndarray, rtol: float) -> dict:
     diff = np.abs(ref - got)
     rng = max(float(np.abs(ref).max()), 1e-9)
+    rel = float(diff.max() / rng)
     res = {
         "max_abs_diff": float(diff.max()),
         "mean_abs_diff": float(diff.mean()),
-        "rel_to_range": float(diff.max() / rng),
-        "atol": atol,
-        "ok": bool(np.all(diff <= atol + 1e-7)),
+        "rel_to_range": rel,
+        "rtol": rtol,
+        "ok": bool(rel <= rtol + 1e-9),
     }
     print(
         f"  [{label:>14s}] max|Δ|={res['max_abs_diff']:.3e}  "
@@ -69,32 +77,56 @@ def update_metadata(meta_path: Path, key: str, payload: dict) -> None:
     meta_path.write_text(json.dumps(data, indent=2))
 
 
-def verify_pt2(out_dir: Path, sample: np.ndarray, ref: np.ndarray) -> dict:
+def _as_tuple(x):
+    if isinstance(x, (list, tuple)):
+        return tuple(x)
+    return (x,)
+
+
+def _summarise_multi(per_output: list[dict], rtol: float) -> dict:
+    rels = [r["rel_to_range"] for r in per_output]
+    abss = [r["max_abs_diff"] for r in per_output]
+    return {
+        "status": "ok" if all(r["ok"] for r in per_output) else "fail",
+        "per_output": per_output,
+        "max_abs_diff": float(max(abss)),
+        "mean_abs_diff": float(np.mean([r["mean_abs_diff"] for r in per_output])),
+        "rel_to_range": float(max(rels)),
+        "rtol": rtol,
+        "ok": all(r["ok"] for r in per_output),
+    }
+
+
+def verify_pt2(out_dir: Path, sample: np.ndarray, refs: tuple) -> dict:
     pt2 = out_dir / "model.pt2"
     if not pt2.exists():
         return {"status": "skipped", "reason": "model.pt2 missing"}
     ep = torch.export.load(str(pt2))
     with torch.inference_mode():
-        out = ep.module()(torch.from_numpy(sample))
-    if isinstance(out, (tuple, list)):
-        out = out[0]
-    res = compare("ExportedProgram", ref, _to_numpy(out), PT2_ATOL)
-    return {"status": "ok" if res["ok"] else "fail", **res}
+        outs = _as_tuple(ep.module()(torch.from_numpy(sample)))
+    per = [
+        compare(f"ExportedProgram[{i}]", r, _to_numpy(o), PT2_RTOL)
+        for i, (r, o) in enumerate(zip(refs, outs))
+    ]
+    return _summarise_multi(per, PT2_RTOL)
 
 
-def verify_onnx(out_dir: Path, sample: np.ndarray, ref: np.ndarray) -> dict:
+def verify_onnx(out_dir: Path, sample: np.ndarray, refs: tuple) -> dict:
     onnx_path = out_dir / "model.onnx"
     if not onnx_path.exists():
         return {"status": "skipped", "reason": "model.onnx missing"}
     import onnxruntime as ort
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     name = sess.get_inputs()[0].name
-    out = sess.run(None, {name: sample})[0]
-    res = compare("ONNX Runtime", ref, out, ORT_ATOL)
-    return {"status": "ok" if res["ok"] else "fail", **res}
+    outs = sess.run(None, {name: sample})
+    per = [
+        compare(f"ONNX Runtime[{i}]", r, o, ORT_RTOL)
+        for i, (r, o) in enumerate(zip(refs, outs))
+    ]
+    return _summarise_multi(per, ORT_RTOL)
 
 
-def verify_qnn_cpu(out_dir: Path, sample: np.ndarray, ref: np.ndarray) -> dict:
+def verify_qnn_cpu(out_dir: Path, sample: np.ndarray, refs: tuple) -> dict:
     """Run model.dlc through QNN's CPU backend and compare.
 
     Routes through the py310 conda env where qairt-quantizer/qnn-net-run live;
@@ -125,11 +157,13 @@ def verify_qnn_cpu(out_dir: Path, sample: np.ndarray, ref: np.ndarray) -> dict:
 
     # qnn-net-run names the output file after the ONNX output tensor; pick whatever raw landed.
     raws = sorted((rd / "output" / "Result_0").glob("*.raw"))
-    if not raws:
-        return {"status": "fail", "error": "no output raw written"}
-    out = np.frombuffer(raws[0].read_bytes(), dtype=np.float32).reshape(ref.shape)
-    cmp_res = compare("QNN CPU", ref, out, QNN_CPU_ATOL)
-    return {"status": "ok" if cmp_res["ok"] else "fail", "output_file": raws[0].name, **cmp_res}
+    if len(raws) < len(refs):
+        return {"status": "fail", "error": f"only {len(raws)} output raws written, need {len(refs)}"}
+    per = []
+    for i, (raw, r) in enumerate(zip(raws, refs)):
+        out = np.frombuffer(raw.read_bytes(), dtype=np.float32).reshape(r.shape)
+        per.append(compare(f"QNN CPU[{i}]", r, out, QNN_CPU_RTOL))
+    return _summarise_multi(per, QNN_CPU_RTOL)
 
 
 def main() -> int:
@@ -141,17 +175,29 @@ def main() -> int:
 
     out_dir = Path(args.variant_dir)
     sample = np.load(out_dir / "sample_input.npy")
-    ref = np.load(out_dir / "sample_output.npy")
-    print(f"[e2e] {out_dir}  input={sample.shape}  ref={ref.shape} {ref.dtype}")
+    # Single-output variants store sample_output.npy; multi-output variants
+    # (e.g. pointmap) store sample_output_<i>.npy in graph order.
+    refs: tuple
+    single = out_dir / "sample_output.npy"
+    if single.exists():
+        refs = (np.load(single),)
+    else:
+        multi_files = sorted(out_dir.glob("sample_output_*.npy"))
+        if not multi_files:
+            print(f"[e2e] no sample outputs in {out_dir}")
+            return 1
+        refs = tuple(np.load(f) for f in multi_files)
+    print(f"[e2e] {out_dir}  input={sample.shape}  outputs={len(refs)}: "
+          f"{[r.shape for r in refs]}")
 
     meta = out_dir / "metadata.json"
 
     print("\n[1/3] PyTorch ExportedProgram ...")
-    pt2_res = verify_pt2(out_dir, sample, ref)
+    pt2_res = verify_pt2(out_dir, sample, refs)
     update_metadata(meta, "verify_pt2", pt2_res)
 
     print("\n[2/3] ONNX Runtime ...")
-    onnx_res = verify_onnx(out_dir, sample, ref)
+    onnx_res = verify_onnx(out_dir, sample, refs)
     update_metadata(meta, "verify_onnx", onnx_res)
 
     qnn_res: Optional[dict] = None
@@ -159,7 +205,7 @@ def main() -> int:
         qnn_res = {"status": "skipped", "reason": "--skip-qnn"}
     else:
         print("\n[3/3] QNN CPU backend ...")
-        qnn_res = verify_qnn_cpu(out_dir, sample, ref)
+        qnn_res = verify_qnn_cpu(out_dir, sample, refs)
     update_metadata(meta, "verify_qnn_cpu", qnn_res)
 
     failures = [k for k, r in {"pt2": pt2_res, "onnx": onnx_res, "qnn_cpu": qnn_res}.items()
