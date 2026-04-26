@@ -1,5 +1,13 @@
 # sapiens2 — On-Device AI bundle for the full model family
 
+> **For teammates:** the live, auto-generated artifact map with absolute
+> paths, byte sizes, and per-variant build status is at
+> [`/mnt/disks/zeticai_database/models/sapiens2/PATHS.md`](file:///mnt/disks/zeticai_database/models/sapiens2/PATHS.md).
+> The end-to-end numerical parity report (PyTorch ↔ ONNX-Runtime ↔ QNN-CPU) is at
+> [`/mnt/disks/zeticai_database/models/sapiens2/VERIFY.md`](file:///mnt/disks/zeticai_database/models/sapiens2/VERIFY.md).
+> Re-generate either with `python3 runner/paths.py` / `bash runner/verify_all.sh`.
+
+
 End-to-end pipeline that takes the **`facebook/sapiens2`** HuggingFace
 index and produces, for **every** advertised variant:
 
@@ -247,6 +255,49 @@ so `run_coreml.py` only converts and verifies the `.mlpackage` reloads;
 move the package to a Mac to do an actual `predict()` against
 `sample_output_*.npy`.
 
+## Pulling artifacts (teammates)
+
+Every variant ships under
+`/mnt/disks/zeticai_database/models/sapiens2/<task>_<size>/` on this
+host. The complete absolute-path manifest is auto-generated:
+
+```bash
+# Regenerate the manifest after any new variant finishes building.
+python3 runner/paths.py
+# Open the manifest:
+less /mnt/disks/zeticai_database/models/sapiens2/PATHS.md
+```
+
+The eight artifacts a downstream consumer cares about per variant:
+
+| key | filename | typical use |
+|---|---|---|
+| `safetensors` | `sapiens2_<size>_<task>.safetensors` | upstream weights, re-importable into PyTorch |
+| `sample_input` | `sample_input.npy` | `(1, 3, 1024, 768)` float32, RNG-seeded; feed any backend with this |
+| `sample_output` | `sample_output.npy` | PyTorch ground-truth output to diff against |
+| `model_pt2` | `model.pt2` | torch.export ExportedProgram (PyTorch ≥ 2.9) |
+| `model_onnx` (+ `.data`) | `model.onnx` | ONNX 18; external-data when weights >2 GB |
+| `model_dlc` | `model.dlc` | QNN/QAIRT FP32 reference |
+| `model_fp16_dlc` | `model_fp16.dlc` | QNN/QAIRT FP16, the on-device HTP target |
+| `model_mlpackage` | `model.mlpackage/` | Apple CoreML MLProgram, FP16, iOS17 minimum |
+
+Quick rsync example:
+
+```bash
+# Single variant
+rsync -a --info=progress2 \
+    "$(hostname):/mnt/disks/zeticai_database/models/sapiens2/pose_0_4b/" \
+    ./local-cache/sapiens2/pose_0_4b/
+
+# Whole family (~250 GB once everything is built — pt2 + onnx + 2× dlc + mlpackage per variant)
+rsync -a --info=progress2 \
+    "$(hostname):/mnt/disks/zeticai_database/models/sapiens2/" \
+    ./local-cache/sapiens2/
+```
+
+Or copy-paste a single absolute path out of `PATHS.md` — every line in
+that table is a full path you can `cp` / `scp` / open directly.
+
 ## Layout
 
 Code (this directory):
@@ -257,8 +308,11 @@ sapiens2/
 ├── runner/
 │   ├── catalog.py                 ← HF index → manifest + INDEX.md
 │   ├── build_variant.py           ← per-variant end-to-end pipeline
-│   ├── run_qnn.sh                 ← qairt-converter → DLC → INT8 → HTP cache
-│   └── run_all.sh                 ← loop over every catalog entry
+│   ├── run_qnn.sh                 ← qairt-converter (FP32 + FP16) → DLCs
+│   ├── run_all.sh                 ← loop over every catalog entry
+│   ├── test_e2e.py                ← numerical parity (pt2 vs ORT vs QNN-CPU)
+│   ├── verify_all.sh              ← test_e2e on every built variant → VERIFY.md
+│   └── paths.py                   ← regenerate PATHS.md (absolute artifact paths)
 └── sapiens2/                      ← (gitignored) clone of facebookresearch/sapiens2
 ```
 
@@ -266,6 +320,8 @@ Artifacts (`/mnt/disks/zeticai_database/models/sapiens2/`):
 
 ```
 INDEX.md                           ← catalog summary, all 21 variants
+PATHS.md                           ← absolute artifact paths (regenerate via runner/paths.py)
+VERIFY.md                          ← pt2 ↔ ORT ↔ QNN-CPU numerical parity report
 catalog.json                       ← machine-readable form of INDEX.md
 RESULTS.md                         ← per-variant pipeline status (auto-updated)
 
