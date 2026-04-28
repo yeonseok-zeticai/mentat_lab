@@ -14,6 +14,24 @@
 검증: 매 단계마다 ONNX Runtime으로 비교, 출력 스칼라 `4294970368.0` 동일
 (`|diff|=0`).
 
+## 편집된 모델 (database)
+재사용/공유용으로 편집된 ONNX + TorchScript는
+`/mnt/disks/zeticai_database/models/trialandtestworld/`에 보관:
+
+| 파일 | 단계 |
+|---|---|
+| `max_ops_final.onnx` | 원본 |
+| `max_ops_final.folded.onnx` | 1) constant fold (1122 → 509) |
+| `max_ops_final.rewritten.onnx` | 2) op rewrite (→ 778) |
+| `max_ops_final.opset13.onnx` | 3) opset 18→17 (변환 입력으로 사용) |
+| `max_ops_final.pt` | 4) TorchScript trace (1.3 MB) |
+| `inputs/` | 검증용 npy 6개 |
+
+`.pt2`는 `torch.export.export`가 onnx2torch의 reshape converter에서 data-dependent
+symbol guard로 막혀서 미생성. 자세한 내용은 database 디렉토리의 `README.md` 참고.
+
+PT 저장 스크립트: `export_pt2.py`.
+
 ## 구성
 
 ```
