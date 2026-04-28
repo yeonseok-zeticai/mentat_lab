@@ -52,6 +52,31 @@ running the scripts.
   `predict()` is macOS-only — the conversion side validates and saves;
   on-device verification is done from a Mac.
 
+## Disk layout (host-specific)
+
+The pipelines pull tens of GB per variant of safetensors and spill multi-GB
+scratch during torch.export / coremltools / qairt-converter runs. On this
+host (`/` is 3.9 TB but constantly near full) we keep all heavy storage on
+`/mnt/disks/zeticai_database/`:
+
+| path on `/` | symlink target (on `/mnt`) | what's there |
+|---|---|---|
+| `~/.cache/huggingface` | `/mnt/disks/zeticai_database/heavy_cache/huggingface` | `hf_hub_download` cache (~395 GB across all sapiens2 + LLM downloads) |
+| `$TMPDIR` (forced by runner) | `/mnt/disks/zeticai_database/tmp_scratch` | torch.export / coremltools / qairt-converter scratch |
+| (no symlink) | `/mnt/disks/zeticai_database/models/` | the per-variant artifact tree (`.pt2`, `.dlc`, `.mlpackage`, …) |
+
+Re-create the symlink on a fresh machine before running anything heavy:
+
+```bash
+mkdir -p /mnt/disks/zeticai_database/heavy_cache /mnt/disks/zeticai_database/tmp_scratch
+[ ! -e ~/.cache/huggingface ] && \
+    ln -s /mnt/disks/zeticai_database/heavy_cache/huggingface ~/.cache/huggingface
+```
+
+`runner/build_variant.py` and `runner/run_qnn.sh` set
+`TMPDIR=/mnt/disks/zeticai_database/tmp_scratch` automatically when that
+directory exists.
+
 ## Repo hygiene
 
 `qnn_244` is a host-specific symlink to the QNN SDK install
