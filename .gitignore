@@ -20,3 +20,6 @@ build.log
 .DS_Store
 .idea/
 .vscode/
+
+# Unrelated workspace contents that should not enter this repo.
+proplus_tier_customer/
