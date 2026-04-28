@@ -255,6 +255,22 @@ so `run_coreml.py` only converts and verifies the `.mlpackage` reloads;
 move the package to a Mac to do an actual `predict()` against
 `sample_output_*.npy`.
 
+## Disk layout (host-specific)
+
+* `~/.cache/huggingface` is a symlink → `/mnt/disks/zeticai_database/heavy_cache/huggingface`.
+  Re-create it on any new machine before running the loop, otherwise the
+  395 GB of safetensors will land on `/` and fill it up:
+
+  ```bash
+  mkdir -p /mnt/disks/zeticai_database/heavy_cache
+  ln -s /mnt/disks/zeticai_database/heavy_cache/huggingface ~/.cache/huggingface
+  ```
+
+* `runner/build_variant.py` and `runner/run_qnn.sh` set
+  `TMPDIR=/mnt/disks/zeticai_database/tmp_scratch` so `torch.export`,
+  `coremltools`, and `qairt-converter` spill scratch onto the big disk
+  too (5B variants spill ~25 GB of tempfiles per stage).
+
 ## Pulling artifacts (teammates)
 
 Every variant ships under

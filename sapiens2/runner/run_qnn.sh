@@ -33,6 +33,12 @@ INPUT_NAME="${3:-input}"
 QAIRT_SDK_ROOT="${QAIRT_SDK_ROOT:-/opt/qcom/aistack/qnn/2.44.0.260225}"
 PY_ENV="${PY_ENV:-py310}"
 
+# qairt-converter spills multi-GB scratch files for 5B-class models — route
+# them to the big disk so / doesn't fill up.
+if [ -d /mnt/disks/zeticai_database/tmp_scratch ]; then
+  export TMPDIR=/mnt/disks/zeticai_database/tmp_scratch
+fi
+
 # shellcheck disable=SC1091
 source /home/yeonseok/miniconda3/etc/profile.d/conda.sh
 conda activate "$PY_ENV"

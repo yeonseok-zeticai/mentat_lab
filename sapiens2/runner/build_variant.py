@@ -39,6 +39,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+# Route torch.export / coremltools / hf_hub scratch space onto the big disk
+# before any of those modules import — `/` only has a few hundred GB free
+# after sapiens2 5B downloads, and torch.export / coremltools spill multi-GB
+# tempfiles during decomposition.
+_BIG_DISK_TMP = Path("/mnt/disks/zeticai_database/tmp_scratch")
+if _BIG_DISK_TMP.exists():
+    os.environ.setdefault("TMPDIR", str(_BIG_DISK_TMP))
+# HuggingFace cache lives under ~/.cache/huggingface (which itself is
+# symlinked onto /mnt/disks/zeticai_database/heavy_cache/huggingface) —
+# nothing to override here, but pin the env var explicitly so children
+# (e.g. run_qnn.sh subshell) inherit it.
+os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
